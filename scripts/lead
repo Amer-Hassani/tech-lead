@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""lead — the tech lead's toolbox.
+
+  lead view SESSION [--from N] [--tail K] [--user] [--grep RX] [--wide]   read the main transcript
+  lead view SESSION --agents                                              list spawned agents + task outputs
+  lead view SESSION --agent ID [--from N] [--tail K]                      read one agent's transcript
+  lead verdict SESSION GO|FIX|STOP "scope" [MINUTES]                      record a verdict (tech lead only)
+  lead status SESSION                                                     is the lead on, is the ship gate open
+  lead off SESSION                                                        switch the lead off (main session, on the user's word)
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import tlcommon as tl  # noqa: E402
+
+MASKS = [
+    (re.compile(r'\b\d{8,10}:[A-Za-z0-9_-]{30,}\b'), '[bot-token]'),
+    (re.compile(r'\b(glpat|ghp|gho|ghs|sk|sk-ant|xox[abprs]|re)[-_][A-Za-z0-9_-]{12,}'), '[token]'),
+    (re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}'), '[jwt]'),
+    (re.compile(r'(?i)\b(password|passwd|secret|api[_-]?hash|api[_-]?key|access[_-]?token|auth[_-]?token|bearer)(["\'\s:=]+)([^\s"\'&,]{6,})'), r'\1\2[hidden]'),
+    (re.compile(r'[A-Za-z0-9+/]{160,}={0,2}'), '[blob]'),
+]
+NOISE = ('<system-reminder>', '<command-', '<local-command', 'Caveat:')
+
+
+def mask(s):
+    for rx, rep in MASKS:
+        s = rx.sub(rep, s)
+    return s
+
+
+def cut(s, n):
+    s = mask(' '.join((s or '').split()) if n < 1500 else (s or '').strip())
+    return s if len(s) <= n else s[:n] + f' …[+{len(s) - n} chars]'
+
+
+def when(o, last_day):
+    t = o.get('timestamp')
+    if not t:
+        return '', last_day
+    d = datetime.datetime.fromisoformat(t.replace('Z', '+00:00')).astimezone()
+    day = d.strftime('%d/%m/%Y')
+    stamp = d.strftime('%H:%M') if day == last_day else d.strftime('%d/%m/%Y %H:%M')
+    return stamp, day
+
+
+def find_transcript(sid):
+    hits = glob.glob(os.path.join(tl.HOME, '.claude', 'projects', '*', sid + '*.jsonl'))
+    hits = [h for h in hits if '/subagents/' not in h]
+    if not hits:
+        sys.exit(f'lead: no transcript for session {sid}')
+    return max(hits, key=os.path.getmtime)
+
+
+def call_summary(name, inp, w):
+    if name == 'Bash':
+        return f"Bash: {cut(inp.get('command', ''), 300 * w)}"
+    if name in ('Edit', 'Write', 'Read', 'NotebookEdit'):
+        extra = f" (+{len(inp.get('content', ''))} chars)" if name == 'Write' else ''
+        return f"{name}: {inp.get('file_path') or inp.get('notebook_path')}{extra}"
+    if name == 'Agent':
+        return (f"Agent: {inp.get('description')} [{inp.get('subagent_type') or 'general-purpose'}"
+                f" model={inp.get('model') or 'default'}] brief: {cut(inp.get('prompt', ''), 400 * w)}")
+    if name == 'SendMessage':
+        return f"SendMessage → {inp.get('to')}: {cut(str(inp.get('message', '')), 600 * w)}"
+    return f"{name}: {cut(json.dumps(inp, ensure_ascii=False), 250 * w)}"
+
+
+def render(path, args):
+    w = 4 if args.get('wide') else 1
+    out, last_day = [], ''
+    with open(path) as f:
+        lines = f.readlines()
+    for n, raw in enumerate(lines, 1):
+        try:
+            o = json.loads(raw)
+        except ValueError:
+            continue
+        t, m = o.get('type'), o.get('message') or {}
+        stamp, day = when(o, last_day)
+        items = []
+        if t == 'user':
+            c = m.get('content')
+            for b in ([{'type': 'text', 'text': c}] if isinstance(c, str) else c or []):
+                if b.get('type') == 'text':
+                    tx = b.get('text', '')
+                    if not tx.strip() or tx.lstrip().startswith(NOISE):
+                        continue
+                    if '<task-notification>' in tx:
+                        s = re.search(r'<summary>(.*?)</summary>', tx, re.S)
+                        items.append(('NOTIFY', cut(s.group(1) if s else tx, 300 * w)))
+                    elif o.get('isSidechain') or n == 1 and args.get('agent'):
+                        items.append(('BRIEF' if n <= 2 else 'IN', cut(tx, 2500 * w)))
+                    else:
+                        items.append(('USER', cut(tx, 3000 * w)))
+                elif b.get('type') == 'tool_result' and not args.get('user'):
+                    r = b.get('content')
+                    r = r if isinstance(r, str) else ' '.join(x.get('text', '[image]' if x.get('type') == 'image' else '')
+                                                              for x in (r or []) if isinstance(x, dict))
+                    if b.get('is_error'):
+                        items.append(('ERROR', cut(r, 500 * w)))
+                    else:
+                        items.append(('result', cut(r, 220 * w)))
+                elif b.get('type') == 'image':
+                    items.append(('USER', '[image attached]'))
+        elif t == 'attachment':
+            a = o.get('attachment') or {}
+            if a.get('type') == 'queued_command':
+                p = a.get('prompt')
+                tx = p if isinstance(p, str) else ' '.join(x.get('text', '') for x in p or [] if isinstance(x, dict))
+                if not tx.strip() or tx.lstrip().startswith(NOISE):
+                    continue
+                if tx.lstrip().startswith(('<agent-message', '<cross-session-message', '<task-notification', '[SYSTEM NOTIFICATION')):
+                    s = re.search(r'<summary>(.*?)</summary>', tx, re.S)
+                    frm = re.search(r'from(?:-name)?="([^"]+)"', tx)
+                    body = s.group(1) if s else re.sub(r'<[^>]+>|^\[SYSTEM NOTIFICATION[^\n]*', '', tx).strip()
+                    items.append((f"NOTIFY from {frm.group(1) if frm else 'system'}", cut(body, 400 * w)))
+                else:
+                    items.append(('USER (mid-task)' if not o.get('isSidechain') else 'IN (mid-task)', cut(tx, 3000 * w)))
+        elif t == 'assistant' and not args.get('user'):
+            for b in m.get('content') or []:
+                if b.get('type') == 'text' and b.get('text', '').strip():
+                    items.append(('CLAUDE', cut(b['text'], 900 * w)))
+                elif b.get('type') == 'tool_use':
+                    items.append(('call', call_summary(b.get('name'), b.get('input') or {}, w)))
+        for kind, body in items:
+            out.append((n, f"L{n} {stamp} {kind}: {body}"))
+        if items:
+            last_day = day
+    rx = re.compile(args['grep'], re.I) if args.get('grep') else None
+    if rx:
+        out = [x for x in out if rx.search(x[1])]
+    if args.get('from'):
+        out = [x for x in out if x[0] >= args['from']]
+    elif not args.get('user'):
+        out = out[-(args.get('tail') or 80):]
+    elif args.get('tail'):
+        out = out[-args['tail']:]
+    print(f"# {path}  ({len(lines)} lines)")
+    for _, line in out:
+        print(line)
+    print(f"— end at L{len(lines)} · next time: --from {len(lines) + 1}")
+
+
+def list_agents(sid, transcript):
+    sdir = transcript[:-len('.jsonl')]
+    metas = sorted(glob.glob(os.path.join(sdir, 'subagents', '*.meta.json')), key=os.path.getmtime)
+    print(f"# agents of {sid}")
+    if not metas:
+        print('(none yet)')
+    for mp in metas:
+        try:
+            d = json.load(open(mp))
+        except ValueError:
+            continue
+        jl = mp.replace('.meta.json', '.jsonl')
+        aid = os.path.basename(jl)[len('agent-'):-len('.jsonl')]
+        age = time.strftime('%d/%m %H:%M', time.localtime(os.path.getmtime(jl if os.path.exists(jl) else mp)))
+        state = 'done' if d.get('finished') else 'running'
+        print(f"{aid}  {state:7} last {age}  {d.get('agentType')} model={d.get('model')} effort={d.get('effort')}  — {d.get('description')}")
+    proj = os.path.basename(os.path.dirname(transcript))
+    tasks = os.path.join(tl.CLAUDE_TMP, proj, sid, 'tasks')
+    if os.path.isdir(tasks):
+        print(f"# background task outputs in {tasks}")
+        for p in sorted(glob.glob(os.path.join(tasks, '*')), key=os.path.getmtime):
+            print(f"{os.path.basename(p)}  {os.path.getsize(p) // 1024} KB  {time.strftime('%H:%M', time.localtime(os.path.getmtime(p)))}")
+
+
+def parse(argv):
+    args, rest, i = {}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--from', '--tail'):
+            args[a[2:]] = int(argv[i + 1]); i += 2
+        elif a in ('--grep', '--agent'):
+            args[a[2:]] = argv[i + 1]; i += 2
+        elif a in ('--user', '--wide', '--agents'):
+            args[a[2:]] = True; i += 1
+        else:
+            rest.append(a); i += 1
+    return args, rest
+
+
+def need_sid(rest):
+    if not rest or not re.match(r'^[0-9a-f-]{8,36}$', rest[0]):
+        sys.exit('lead: give the session id first (it is in your start-hook context)')
+    return rest[0]
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help', 'help'):
+        print(__doc__); return
+    cmd, args, rest = argv[0], *parse(argv[1:])
+    sid = need_sid(rest)
+    if cmd == 'view':
+        tr = find_transcript(sid)
+        if args.get('agents'):
+            list_agents(os.path.basename(tr)[:-6], tr)
+        elif args.get('agent'):
+            hits = glob.glob(os.path.join(tr[:-6], 'subagents', f"agent-{args['agent']}*.jsonl"))
+            if not hits:
+                sys.exit(f"lead: no agent {args['agent']} in this session (try --agents)")
+            render(hits[0], args)
+        else:
+            render(tr, args)
+    elif cmd == 'verdict':
+        if not tl.SID_RX.match(sid) or len(rest) < 3 or rest[1].upper() not in ('GO', 'FIX', 'STOP'):
+            sys.exit('usage: lead verdict SESSION GO|FIX|STOP "scope" [MINUTES]')
+        value, scope = rest[1].upper(), rest[2]
+        minutes = int(rest[3]) if len(rest) > 3 else (30 if value == 'GO' else 0)
+        minutes = max(0, min(minutes, 240))
+        rec = tl.set_verdict(sid, value, scope, minutes)
+        tl.log(sid, f"VERDICT {value} ({minutes} min) — {scope}")
+        if value == 'GO' and minutes:
+            print(f"GO recorded: ship gate open until {tl.hhmm(rec['until'])} for: {scope}")
+        else:
+            print(f"{value} recorded: ship gate closed. Scope: {scope}")
+    elif cmd == 'status':
+        a, v = tl.active(sid), tl.verdict(sid)
+        if not a:
+            print('Lead: off for this session (no active tech lead in the last 12 h). Ship gate: not enforced.'); return
+        print(f"Lead: on since {time.strftime('%d/%m/%Y %H:%M', time.localtime(a['started']))}, last active {tl.hhmm(a['last_seen'])}.")
+        if tl.gate_open(sid):
+            print(f"Ship gate: OPEN until {tl.hhmm(v['until'])} — {v['scope']}")
+        elif v:
+            print(f"Ship gate: closed. Last verdict {v['verdict']} at {tl.hhmm(v['at'])} — {v['scope']}")
+        else:
+            print('Ship gate: closed. No verdict yet.')
+    elif cmd == 'off':
+        tl.deactivate(sid)
+        tl.log(sid, 'OFF — lead switched off from the main session')
+        print('Lead off for this session; ship gate no longer enforced.')
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

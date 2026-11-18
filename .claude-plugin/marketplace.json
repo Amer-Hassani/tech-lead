@@ -1,0 +1,11 @@
+{
+  "name": "tech-lead",
+  "owner": { "name": "Amer Hassani" },
+  "plugins": [
+    {
+      "name": "tech-lead",
+      "source": "./",
+      "description": "A read-only tech lead that reviews your session at checkpoints and gates pushes and deploys until it says GO."
+    }
+  ]
+}

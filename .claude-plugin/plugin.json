@@ -1,0 +1,19 @@
+{
+  "name": "tech-lead",
+  "version": "1.0.0",
+  "description": "A read-only tech lead for Claude Code. It reads the whole session, reviews the builder and every agent it spawns at checkpoints, answers GO / FIX / STOP, and a hook blocks pushes, deploys and other ship actions until it says GO.",
+  "author": {
+    "name": "Amer Hassani"
+  },
+  "license": "MIT",
+  "keywords": [
+    "tech-lead",
+    "review",
+    "supervisor",
+    "ship-gate",
+    "agents",
+    "hooks"
+  ],
+  "homepage": "https://github.com/Amer-Hassani/tech-lead",
+  "repository": "https://gitlab.com/amerhassani/tech-lead"
+}
